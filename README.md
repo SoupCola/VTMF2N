@@ -1,6 +1,6 @@
 # VTMF2N: Towards Accurate Visual-Tactile Slip Detection via Multi-modal Feature Fusion in Robotic Grasping
 
-This repository contains the official implementation of the paper:
+This repository contains the implementation of the paper:
 
 **VTMF2N: Towards Accurate Visual-Tactile Slip Detection via Multi-modal Feature Fusion in Robotic Grasping**
 
@@ -45,7 +45,7 @@ Adjust the [config.yaml](./config.yaml) file according to your setup:
 To train the VTMF2N model:
 
 ```bash
-python train.py
+python main.py
 ```
 
 The training script will:

@@ -7,8 +7,6 @@ import numpy as np
 from einops import rearrange, reduce, repeat
 import sys
 
-new_path = '/home/tangqian/VTMF2Nv2'
-sys.path.append(new_path)
 import time
 
 

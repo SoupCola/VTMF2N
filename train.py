@@ -1,3 +1,8 @@
+"""
+Model Training Module  
+Contains all functions needed to train the Vision-Tactile Multimodal Fusion Network (VTMF2N)  
+"""
+
 import os
 import sys
 import time
@@ -5,402 +10,366 @@ import yaml
 import json
 from datetime import datetime
 
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+
 import numpy as np
 import torch
-from torch import optim
-from torch import nn
-from torch.utils.data.dataloader import DataLoader
-import matplotlib.pyplot as plt
+from torch import optim, nn
+from torch.utils.data import DataLoader
 
+# Import project-specific utilities  
 from utils import data_loader
-from utils import model_factory
-from utils import model_factory_single
-from utils import log_record
+from utils import model_factory          # for multimodal models    
+from utils import model_factory_single   # for single-modality models 
+from utils import log_record             # logging utility           
+from utils.plot_results import plot_loss_accuracy
 
-cuda_avail = torch.cuda.is_available()
+# Check CUDA availability  
+cuda_available = torch.cuda.is_available()
 
-# 使用热身策略
+
+# Learning rate scheduler with warmup  
 def lr_lambda(step, warmup_steps, init_lr, decay_factor):
-    """计算学习率的lambda函数，用于LambdaLR调度器"""
+    """Lambda function for learning rate scheduling with warmup and exponential decay  
+    """
     if step < warmup_steps:
         return float(step) / float(max(1, warmup_steps))
     return decay_factor ** (step - warmup_steps)
 
-def plot_loss_accuracy(train_loss, val_loss, train_acc, val_acc, save_path, colors,
-                       loss_legend_loc='upper center', acc_legend_loc='upper left',
-                       fig_size=(20, 10), sub_plot1=(1, 2, 1), sub_plot2=(1, 2, 2)):
-    plt.rcParams["figure.figsize"] = fig_size
-    fig = plt.figure()
 
-    plt.subplot(sub_plot1[0], sub_plot1[1], sub_plot1[2])
-
-    t_loss = np.array(train_loss)
-    v_loss = np.array(val_loss)
-    x_train = range(t_loss.size)
-    x_val = range(v_loss.size)
-
-    min_train_loss = t_loss.min()
-
-    min_val_loss = v_loss.min()
-
-    plt.plot(x_train, train_loss, linestyle='-', color='tab:{}'.format(colors[0]),
-             label="TRAIN LOSS ({0:.4})".format(min_train_loss))
-    plt.plot(x_val, val_loss, linestyle='--', color='tab:{}'.format(colors[0]),
-             label="VALID LOSS ({0:.4})".format(min_val_loss))
-
-    plt.xlabel('epoch no.')
-    plt.ylabel('loss')
-    plt.legend(loc=loss_legend_loc)
-    plt.title('Training and Validation Loss')
-
-    plt.subplot(sub_plot2[0], sub_plot2[1], sub_plot2[2])
-
-    t_acc = np.array(train_acc)
-    v_acc = np.array(val_acc)
-    x_train = range(t_acc.size)
-    x_val = range(v_acc.size)
-
-    max_train_acc = t_acc.max()
-    max_val_acc = v_acc.max()
-
-    plt.plot(x_train, train_acc, linestyle='-', color='tab:{}'.format(colors[0]),
-             label="TRAIN ACC ({0:.4})".format(max_train_acc))
-    plt.plot(x_val, val_acc, linestyle='--', color='tab:{}'.format(colors[0]),
-             label="VALID ACC ({0:.4})".format(max_val_acc))
-
-    plt.xlabel('epoch no.')
-    plt.ylabel('accuracy')
-    plt.legend(loc=acc_legend_loc)
-    plt.title('Training and Validation Accuracy')
-
-    file_path = os.path.join(save_path, 'loss_acc_plot.png')
-    fig.savefig(file_path)
-
-    return
-
-
+# Main training function  
 def train_net(params):
+    """
+    Execute full training pipeline based on configuration  
+    """
 
-    # Determine whether to use GPU
+    # ========================================================================
+    # 1. Device Setup (CPU/GPU)  
+    # ========================================================================
+    use_gpu = False
+    device = torch.device("cpu")
+
     if params['use_gpu'] == 1:
-        print("GPU:" + str(params['use_gpu']))
-    if params['use_gpu'] == 1 and cuda_avail:
-        print("use_gpu=True and Cuda Available. Setting Device=CUDA")
-        device = torch.device("cuda:0")  # change the GPU index based on the availability
-        use_gpu = True
+        print("GPU enabled in config: use_gpu=1")
+        if cuda_available:
+            print("CUDA available → Using GPU")
+            device = torch.device("cuda:0")
+            use_gpu = True
+        else:
+            print("CUDA not available → Falling back to CPU")
     else:
-        print("Setting Device=CPU")
-        device = torch.device("cpu")
-        use_gpu = False
+        print("GPU disabled in config → Using CPU")
 
-    # Create dir to save model and other training artifacts
-    if 'save_dir' in params.keys():
+    # ========================================================================
+    # 2. Directory and Logging Setup  
+    # ========================================================================
+    exp_save_dir = None
+    if 'save_dir' in params:
         model_save_dir = os.path.join(params['save_dir'], params['Model_name'])
-        if (os.path.exists(model_save_dir) == False):
+        if not os.path.exists(model_save_dir):
             os.mkdir(model_save_dir)
-        dt = datetime.now()
-        dt_string = dt.strftime("%d_%m_%Y__%H_%M_%S")
-        exp_save_dir = os.path.join(model_save_dir, dt_string)
+
+        # Create timestamped experiment folder  
+        timestamp = datetime.now().strftime("%d_%m_%Y__%H_%M_%S")
+        exp_save_dir = os.path.join(model_save_dir, timestamp)
         os.mkdir(exp_save_dir)
 
-        # create a log file to record the terminal info
+        # Initialize log file  
         log_record.create_log(exp_save_dir)
 
-        # Save config used for this experiment
+        # Save config copy  
         yaml_path = os.path.join(exp_save_dir, 'config.yaml')
-        with open(yaml_path, 'w') as outfile:
-            yaml.dump(params, outfile, default_flow_style=False)
+        with open(yaml_path, 'w') as f:
+            yaml.dump(params, f, default_flow_style=False)
 
-    # Set seed
-    if params['use_random_seed'] == 0:
+    # ========================================================================
+    # 3. Reproducibility & Model Initialization  
+    # ========================================================================
+    if params.get('use_random_seed', 1) == 0:
         torch.manual_seed(params['seed'])
-    # Create network & Init Layer weights
+
+    # Build model based on modality  
     if params['Modality'] == "Combined":
-        NN_model, model_params = model_factory.get_model(params, use_gpu)
-    elif params['Modality'] == "Tactile" or params['Modality'] == "Visual":
-        NN_model, model_params = model_factory_single.get_model(params, use_gpu)
-
-    # print("torch.cuda.device_count:{}".format(torch.cuda.device_count()))
-    # if torch.cuda.device_count() > 1:  # 检查电脑是否有多块GPU
-    #     print(f"Let's use {torch.cuda.device_count()} GPUs!")
-    #     NN_model = nn.DataParallel(NN_model)  # 将模型对象转变为多GPU并行运算的模型
-    # NN_model.to(device)  # 把并行的模型移动到GPU上
-
-    # Save model params used for this experiment
-    if 'save_dir' in params.keys():
-        model_params_path = os.path.join(exp_save_dir, 'model_params.json')
-        with open(model_params_path, 'w') as outfile:
-            json.dump(model_params, outfile)
-
-    if params['skip_init_in_train'] == 0:
-        NN_model.init_weights()
-    # TODO: Load previous model, if any
-
-    # Init optimizer & loss func.
-    loss_function = nn.CrossEntropyLoss()
-    if use_gpu:
-        NN_model = NN_model.cuda()
-        loss_function = loss_function.cuda()
-
-    scheduler = None
-    if params['adam_warmup']:
-        optimizer = optim.Adam(NN_model.parameters(), lr=float(params['lr']))
-        # 定义预热步数和初始学习率
-        warmup_epochs = params['warmup_epochs']
-        lr=float(params['lr'])
-        decay_factor = 0.999  # 指数衰减因子
-        from torch.optim.lr_scheduler import LambdaLR
-        # 创建LambdaLR调度器
-        scheduler = LambdaLR(optimizer, lr_lambda=lambda step: lr_lambda(step, warmup_epochs, lr, decay_factor))
-
-        print('Using adam-warmup')
-        print('lr: {}'.format(params['lr']))
-        print('warmup_epochs: {}'.format(params['warmup_epochs']))
+        model, model_params = model_factory.get_model(params, use_gpu)
+    elif params['Modality'] in ["Tactile", "Visual"]:
+        model, model_params = model_factory_single.get_model(params, use_gpu)
     else:
-        optimizer = optim.Adam(NN_model.parameters(), lr=float(params['lr']))
+        raise ValueError(f"Unsupported Modality: {params['Modality']}")
 
-    # Dataloader
-    train_dataset = data_loader.Tactile_Vision_dataset(params["scale_ratio"], params["video_length"],
-                                                       data_path=params['Train_data_dir'])
-    train_data_loader = DataLoader(train_dataset, batch_size=params['batch_size'], shuffle=False,
-                                   num_workers=params['num_workers'])
+    # Save model architecture info  
+    if exp_save_dir:
+        model_params_path = os.path.join(exp_save_dir, 'model_params.json')
+        with open(model_params_path, 'w') as f:
+            json.dump(model_params, f)
 
-    valid_dataset = data_loader.Tactile_Vision_dataset(params["scale_ratio"], params["video_length"],
-                                                       data_path=params['Valid_data_dir'])
-    valid_data_loader = DataLoader(valid_dataset, batch_size=params['batch_size'], shuffle=False,
-                                   num_workers=params['num_workers'])
+    # Initialize weights if required  
+    if params.get('skip_init_in_train', 1) == 0:
+        model.init_weights()
 
-    test_dataset = data_loader.Tactile_Vision_dataset(params["scale_ratio"], params["video_length"],
-                                                      data_path=params['Test_data_dir'])
-    test_data_loader = DataLoader(test_dataset, batch_size=params['batch_size'], shuffle=False,
-                                  num_workers=params['num_workers'])
+    # Move model to device  
+    if use_gpu:
+        model = model.cuda()
 
-    # Test a single feed-forward only process (uncomment this block if you pass the test)
-    data = next(iter(train_data_loader))
+    # ========================================================================
+    # 4. Optimizer, Scheduler & Loss Function  
+    # ========================================================================
+    loss_fn = nn.CrossEntropyLoss()
+    if use_gpu:
+        loss_fn = loss_fn.cuda()
 
-    print("Print feed-forward test results:")
-    # Camera images: data[0].shape ->  torch.Size([1, 3, 5, 240, 320])  batch_size, channel (RGB), depth, height, width
-    # Tactile images: data[1].shape ->  torch.Size([1, 3, 5, 240, 320])  batch_size, channel (RGB), depth, height, width
-    # labels: data[2].shape ->  torch.Size([4])  batch_size
-    # print(data[0].shape)
-    # print(data[1].shape)
-    # print(data[2].shape)
+    # Configure optimizer with optional warmup  
+    if params.get('adam_warmup', False):
+        optimizer = optim.Adam(model.parameters(), lr=float(params['lr']))
+        warmup_epochs = params['warmup_epochs']
+        base_lr = float(params['lr'])
+        decay_factor = params['decay_factor']
+        from torch.optim.lr_scheduler import LambdaLR
+        scheduler = LambdaLR(optimizer, lr_lambda=lambda step: lr_lambda(step, warmup_epochs, base_lr, decay_factor))
+        print('Using Adam with warmup strategy')
+        print(f'Base LR: {base_lr}, Warmup epochs: {warmup_epochs}')
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=float(params['lr']))
+        scheduler = None
 
+    # ========================================================================
+    # 5. Data Loaders  
+    # ========================================================================
+    common_args = {
+        'scale_ratio': params["scale_ratio"],
+        'video_length': params["video_length"]
+    }
+
+    train_dataset = data_loader.Tactile_Vision_dataset(data_path=params['Train_data_dir'], **common_args)
+    valid_dataset = data_loader.Tactile_Vision_dataset(data_path=params['Valid_data_dir'], **common_args)
+    test_dataset = data_loader.Tactile_Vision_dataset(data_path=params['Test_data_dir'], **common_args)
+
+    dataloader_kwargs = {
+        'batch_size': params['batch_size'],
+        'shuffle': False,
+        'num_workers': params['num_workers']
+    }
+
+    train_loader = DataLoader(train_dataset, **dataloader_kwargs)
+    valid_loader = DataLoader(valid_dataset, **dataloader_kwargs)
+    test_loader = DataLoader(test_dataset, **dataloader_kwargs)
+
+    # ========================================================================
+    # 6. Forward Pass Test (Sanity Check)  
+    # ========================================================================
+    sample_batch = next(iter(train_loader))
+    rgb_imgs, tactile_imgs, labels = sample_batch
+
+    print("Running feed-forward sanity check:")
     if params['Modality'] == "Combined":
-        if params['Model_name'] == "VTMF2Nv2":
-            output_similarity, output = NN_model(data[0], data[1])
-        else:
-            output = NN_model(data[0], data[1])
+        output = model(rgb_imgs, tactile_imgs)
     elif params['Modality'] == "Visual":
-        output = NN_model(data[0])
+        output = model(rgb_imgs)
     elif params['Modality'] == "Tactile":
-        output = NN_model(data[1])
-    _, predicted = torch.max(output.data, 1)
-    print(output)  # Transformer output
-    print(predicted)  # prediction
-    print(data[2])  # Label data
-    print("Pass the feed-forward test!")
-    # print(NN_model)
-    # sys.exit(0)
-    # Test a single feed-forward only process
-    #
+        output = model(tactile_imgs)
 
-    # 训练部分 注释
-    # To record training procession
-    train_loss = []
-    train_acc = []
-    valid_loss = []
-    valid_acc = []
-    max_valid_acc = 0.0
-    max_test_acc = 0.0
-    # Start training
-    t_start = time.time()
+    _, pred = torch.max(output.data, 1)
+    print("Model output:", output)
+    print("Prediction:", pred)
+    print("Ground truth:", labels)
+    print("✓ Feed-forward test passed!")
+
+    # ========================================================================
+    # 7. Training Loop  
+    # ========================================================================
+    train_loss_hist, train_acc_hist = [], []
+    valid_loss_hist, valid_acc_hist = [], []
+    best_test_acc = 0.0
+
+    start_time = time.time()
+
     for epoch in range(params['epochs']):
-        # Start
+        # --------------------------------------------------------------------
+        # Training Phase  
+        # --------------------------------------------------------------------
+        model.train()
         train_total_loss = 0.0
-        train_total_acc = 0.0
-        train_total = 0.0
+        train_correct = 0
+        train_total_samples = 0
 
-        valid_total_loss = 0.0
-        valid_total_acc = 0.0
-        valid_total = 0.0
+        for batch_idx, (rgb, tactile, label) in enumerate(train_loader):
+            model.zero_grad()
 
-        NN_model.train()
-        for i, data in enumerate(train_data_loader):
-            NN_model.zero_grad()
-            # one iteration
-            rgb_imgs = data[0]
-            tactile_imgs = data[1]
-            label = data[2]
+            # Forward pass  
             if params['Modality'] == "Combined":
-                if params['Model_name'] == "VTMF2Nv2":
-                    output_similarity, output = NN_model(rgb_imgs, tactile_imgs)
-                else:
-                    output = NN_model(rgb_imgs, tactile_imgs)
+                    logits = model(rgb, tactile)
             elif params['Modality'] == "Visual":
-                output = NN_model(rgb_imgs)
-            elif params['Modality'] == "Tactile":
-                output = NN_model(tactile_imgs)
+                logits = model(rgb)
+            else:  # Tactile
+                logits = model(tactile)
+
             if use_gpu:
-                label = label.to('cuda')
-            if params['Model_name'] == "VTMF2Nv2":
-                loss = loss_function(output, label) + torch.sum(output_similarity).item()
-                # loss = loss_function(output, label)
-            else:
-                loss = loss_function(output, label)
-            # Backward & optimize
+                label = label.cuda()
+
+            # Compute loss  
+            loss = loss_fn(logits, label)
+
+            # Backward & optimize  
             loss.backward()
-            optimizer.step()  # update the parameters
+            optimizer.step()
             if scheduler is not None:
-                scheduler.step()  # 在优化器更新参数后更新学习率
-            # cal training acc
-            _, predicted = torch.max(output.data, 1)
-            train_total_acc += (predicted == label).sum().item()
-            train_total_loss += float(loss.data)
-            train_total += len(label)
-        train_loss.append(train_total_loss / train_total)
-        train_acc.append(train_total_acc / train_total)
-        elapsed_time = time.time() - t_start
-        speed_epoch = elapsed_time / (epoch + 1)
-        speed_batch = speed_epoch / len(train_data_loader)
-        eta = speed_epoch * params['epochs'] - elapsed_time
-        if epoch % params['print_interval'] == 0:
-            message = '[Epoch: %3d/%3d] Training Loss: %.3f, Training Acc: %.3f' % (
-            epoch, params['epochs'], train_loss[epoch], train_acc[epoch])
-            log_record.update_log(exp_save_dir, message)
-            print(message)
+                scheduler.step()
 
-        NN_model.eval()
+            # Track metrics  
+            _, predicted = torch.max(logits.data, 1)
+            train_correct += (predicted == label).sum().item()
+            train_total_loss += loss.item()
+            train_total_samples += label.size(0)
+
+        avg_train_loss = train_total_loss / train_total_samples
+        avg_train_acc = train_correct / train_total_samples
+        train_loss_hist.append(avg_train_loss)
+        train_acc_hist.append(avg_train_acc)
+
+        # --------------------------------------------------------------------
+        # Validation Phase  
+        # --------------------------------------------------------------------
+        model.eval()
+        valid_total_loss = 0.0
+        valid_correct = 0
+        valid_total_samples = 0
+
         with torch.no_grad():
-            for rgb_imgs, tactile_imgs, label in valid_data_loader:
+            for rgb, tactile, label in valid_loader:
                 if params['Modality'] == "Combined":
-                    if params['Model_name'] == "VTMF2Nv2":
-                        output_similarity, output = NN_model(rgb_imgs, tactile_imgs)
-                    else:
-                        output = NN_model(rgb_imgs, tactile_imgs)
+                        logits = model(rgb, tactile)
                 elif params['Modality'] == "Visual":
-                    output = NN_model(rgb_imgs)
-                elif params['Modality'] == "Tactile":
-                    output = NN_model(tactile_imgs)
-                if params['use_gpu']:
-                    label = label.cuda()
-                if params['Model_name'] == "VTMF2Nv2":
-                    loss = loss_function(output, label) + torch.sum(output_similarity).item()
-                    # loss = loss_function(output, label)
+                    logits = model(rgb)
                 else:
-                    loss = loss_function(output, label)
-                _, predicted = torch.max(output.data, 1)
-                valid_total_acc += (predicted == label).sum().item()
-                valid_total_loss += float(loss.data)
-                valid_total += len(label)
-        valid_loss.append(valid_total_loss / valid_total)
-        valid_acc.append(valid_total_acc / valid_total)
-        if epoch % params['print_interval'] == 0:
-            message = '[Epoch: %3d/%3d] Validation Loss: %.3f, Validation Acc: %.3f' % (
-            epoch, params['epochs'], valid_loss[epoch], valid_acc[epoch])
-            log_record.update_log(exp_save_dir, message)
-            print(message)
-            message = "Elapsed {:.2f}s, {:.2f} s/epoch, {:.2f} s/batch, ets {:.2f}s".format(
-                elapsed_time, speed_epoch, speed_batch, eta)
-            print(message)
-            log_record.update_log(exp_save_dir, message)
+                    logits = model(tactile)
 
-        # if valid_acc[epoch] > max_valid_acc:
-        # max_valid_acc = valid_acc[epoch]
-        if params['test_eval'] == 1:
+                if use_gpu:
+                    label = label.cuda()
+
+                loss = loss_fn(logits, label)
+
+                _, predicted = torch.max(logits.data, 1)
+                valid_correct += (predicted == label).sum().item()
+                valid_total_loss += loss.item()
+                valid_total_samples += label.size(0)
+
+        avg_valid_loss = valid_total_loss / valid_total_samples
+        avg_valid_acc = valid_correct / valid_total_samples
+        valid_loss_hist.append(avg_valid_loss)
+        valid_acc_hist.append(avg_valid_acc)
+
+        # --------------------------------------------------------------------
+        # Logging & Timing  
+        # --------------------------------------------------------------------
+        elapsed = time.time() - start_time
+        avg_time_per_epoch = elapsed / (epoch + 1)
+        avg_time_per_batch = avg_time_per_epoch / len(train_loader)
+        eta = avg_time_per_epoch * params['epochs'] - elapsed
+
+        if epoch % params.get('print_interval', 1) == 0:
+            msg_train = f"[Epoch {epoch:3d}/{params['epochs']}] Train Loss: {avg_train_loss:.3f}, Acc: {avg_train_acc:.3f}"
+            msg_valid = f"[Epoch {epoch:3d}/{params['epochs']}] Valid Loss: {avg_valid_loss:.3f}, Acc: {avg_valid_acc:.3f}"
+            msg_time = f"Elapsed {elapsed:.2f}s, {avg_time_per_epoch:.2f}s/epoch, {avg_time_per_batch:.2f}s/batch, ETA {eta:.2f}s"
+
+            print(msg_train)
+            print(msg_valid)
+            print(msg_time)
+
+            if exp_save_dir:
+                log_record.update_log(exp_save_dir, msg_train)
+                log_record.update_log(exp_save_dir, msg_valid)
+                log_record.update_log(exp_save_dir, msg_time)
+
+        # --------------------------------------------------------------------
+        # Optional Test Evaluation & Model Saving  
+        # --------------------------------------------------------------------
+        if params.get('test_eval', 0) == 1:
+            model.eval()
             test_total_loss = 0.0
-            test_total_acc = 0.0
-            test_total = 0.0
-            NN_model.eval()
+            test_correct = 0
+            test_total_samples = 0
+
             with torch.no_grad():
-                for rgb_imgs, tactile_imgs, label in test_data_loader:
-                    if params['use_gpu'] == 1:
-                        rgb_imgs = rgb_imgs.cuda()
-                        tactile_imgs = tactile_imgs.cuda()
-
+                for rgb, tactile, label in test_loader:
                     if params['Modality'] == "Combined":
-                        if params['Model_name'] == "VTMF2Nv2":
-                            output_similarity, output = NN_model(rgb_imgs, tactile_imgs)
-                        else:
-                            output = NN_model(rgb_imgs, tactile_imgs)
+                        logits = model(rgb, tactile)
                     elif params['Modality'] == "Visual":
-                        output = NN_model(rgb_imgs)
-                    elif params['Modality'] == "Tactile":
-                        output = NN_model(tactile_imgs)
-                    if params['use_gpu']:
+                        logits = model(rgb)
+                    else:
+                        logits = model(tactile)
+
+                    if use_gpu:
                         label = label.cuda()
-                    if params['Model_name'] == "VTMF2Nv2":
-                        loss = loss_function(output, label) + torch.sum(output_similarity).item()
-                        # loss = loss_function(output, label)
-                    else:
-                        loss = loss_function(output, label)
-                    _, predicted = torch.max(output.data, 1)
-                    test_total_acc += (predicted == label).sum().item()
-                    test_total_loss += float(loss.data)
-                    test_total += len(label)
-            test_total_loss = test_total_loss / test_total
-            test_total_acc = test_total_acc / test_total
-        print("current_test_total_acc:{}".format(test_total_acc))
-        if test_total_acc > max_test_acc:
-            max_test_acc = test_total_acc
-            message = 'Model Improved: [Epoch: %3d/%3d] Test Loss: %.3f, Test Acc: %.3f' % (
-            epoch, params['epochs'], test_total_loss, test_total_acc)
-            log_record.update_log(exp_save_dir, message)
-            print(message)
-            if 'save_dir' in params.keys():
-                print(' Model improved. Saving model')
-                model_path = os.path.join(exp_save_dir + '/' + params['Model_name'] + '_{:0>5}.pt'.format(epoch))
-                state_dict = {'model': NN_model.state_dict(), 'optimizer': optimizer.state_dict()}
-                torch.save(state_dict, model_path)
 
-        print(" ")
+                    _, predicted = torch.max(logits.data, 1)
+                    test_correct += (predicted == label).sum().item()
+                    test_total_loss += loss.item()
+                    test_total_samples += label.size(0)
 
-        # do one feed-forward on the test dataset
-    if params['test_eval'] == 1:
+            test_acc = test_correct / test_total_samples
+            test_loss = test_total_loss / test_total_samples
+
+            print(f"Current test accuracy: {test_acc:.4f}")
+
+            # Save best model based on test accuracy  
+            if test_acc > best_test_acc:
+                best_test_acc = test_acc
+                msg_best = f"★ Model Improved! [Epoch {epoch}] Test Loss: {test_loss:.3f}, Acc: {test_acc:.3f}"
+                print(msg_best)
+                if exp_save_dir:
+                    log_record.update_log(exp_save_dir, msg_best)
+                    model_path = os.path.join(exp_save_dir, f"{params['Model_name']}_{epoch:05d}.pt")
+                    torch.save({
+                        'model': model.state_dict(),
+                        'optimizer': optimizer.state_dict()
+                    }, model_path)
+
+        print("")  # Empty line between epochs
+
+    # ========================================================================
+    # 8. Final Test Evaluation & Cleanup  
+    # ========================================================================
+    if params.get('test_eval', 0) == 1:
+        model.eval()
         test_total_loss = 0.0
-        test_total_acc = 0.0
-        test_total = 0.0
-        NN_model.eval()
+        test_correct = 0
+        test_total_samples = 0
+
         with torch.no_grad():
-            for rgb_imgs, tactile_imgs, label in test_data_loader:
+            for rgb, tactile, label in test_loader:
                 if params['Modality'] == "Combined":
-                    if params['Model_name'] == "VTMF2Nv2":
-                        output_similarity, output = NN_model(rgb_imgs, tactile_imgs)
-                    else:
-                        output = NN_model(rgb_imgs, tactile_imgs)
+                    logits = model(rgb, tactile)
                 elif params['Modality'] == "Visual":
-                    output = NN_model(rgb_imgs)
-                elif params['Modality'] == "Tactile":
-                    output = NN_model(tactile_imgs)
-                if params['use_gpu']:
-                    label = label.cuda()
-                if params['Model_name'] == "VTMF2Nv2":
-                    loss = loss_function(output, label) + torch.sum(output_similarity).item()
-                    # loss = loss_function(output, label)
+                    logits = model(rgb)
                 else:
-                    loss = loss_function(output, label)
-                _, predicted = torch.max(output.data, 1)
-                test_total_acc += (predicted == label).sum().item()
-                test_total_loss += float(loss.data)
-                test_total += len(label)
-        test_total_loss = test_total_loss / test_total
-        test_total_acc = test_total_acc / test_total
-        message = 'After the final epoch: Test Loss: %.3f, Test Acc: %.3f' % (test_total_loss, test_total_acc)
-        log_record.update_log(exp_save_dir, message)
-        print(message)
+                    logits = model(tactile)
 
-    if 'save_dir' in params.keys():
-        model_path = os.path.join(exp_save_dir + '/' + params['Model_name'] + '_last.pt'.format(epoch))
-        state_dict = {'model': NN_model.state_dict(), 'optimizer': optimizer.state_dict()}
-        torch.save(state_dict, model_path)
-        plot_loss_accuracy(train_loss, valid_loss, train_acc, valid_acc, exp_save_dir, colors=['blue'],
-                           loss_legend_loc='upper center', acc_legend_loc='upper left')
+                if use_gpu:
+                    label = label.cuda()
 
-    if params['freeze_epochs'] != 0 and epoch == (params['epochs'] - params['freeze_epochs'] - 1):
-        print('Freeze training epoch{}'.format(epoch))
-        for param in NN_model.gnet.parameters():
-            param.requires_grad = False
-        for param in NN_model.pnet.parameters():
-            param.requires_grad = False
+                loss = loss_fn(logits, label)
 
+                _, predicted = torch.max(logits.data, 1)
+                test_correct += (predicted == label).sum().item()
+                test_total_loss += loss.item()
+                test_total_samples += label.size(0)
+
+        final_test_acc = test_correct / test_total_samples
+        final_test_loss = test_total_loss / test_total_samples
+        msg_final = f"Final Test Results → Loss: {final_test_loss:.3f}, Acc: {final_test_acc:.3f}"
+        print(msg_final)
+        if exp_save_dir:
+            log_record.update_log(exp_save_dir, msg_final)
+
+    # Save final model and plots  
+    if exp_save_dir:
+        last_model_path = os.path.join(exp_save_dir, f"{params['Model_name']}_last.pt")
+        torch.save({
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict()
+        }, last_model_path)
+
+        plot_loss_accuracy(
+            train_loss_hist, valid_loss_hist,
+            train_acc_hist, valid_acc_hist,
+            exp_save_dir, colors=['blue']
+        )
