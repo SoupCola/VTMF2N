@@ -1,0 +1,73 @@
+use_gpu: 1                     # Use GPU if available (1 = True, 0 = False)
+num_workers: 0                 # Number of data loading workers (0 = load in main thread)
+batch_size: 1                  # Batch size per device
+lr: 5e-6                       # Initial learning rate
+adam_warmup: False             # Enable learning rate warmup?
+warmup_epochs: 6               # Warmup duration (epochs)
+decay_factor: 0.999            # Learning rate decay factor per epoch after warmup
+Train_data_dir: /home/tangqian/dataset/Gelsight_data/training    # Training data directory
+Valid_data_dir: /home/tangqian/dataset/Gelsight_data/validation  # Validation data directory
+Test_data_dir: /home/tangqian/dataset/Gelsight_data/testing      # Test data directory
+# =============================================================================
+Image_width: 640               # Original frame width (pixels)
+Image_height: 480              # Original frame height (pixels)
+scale_ratio: 0.5               # Resize ratio: (480,640) → (240,320)
+video_length: 16               # Number of frames per video clip
+Modality: Combined             # Input type: 'Combined', 'Tactile', or 'Visual'
+
+# =============================================================================
+# Supported Model_name options:
+# 支持的 Model_name 选项包括：
+#
+# - CNN-based temporal models:
+#   • CNN_LSTM          → CNN (ResNet) + LSTM
+#   • CNN_MSTCN          → CNN + Multi-Stage Temporal Convolutional Network
+#   • C3D                → 3D Convolutional Network (Tran et al.)
+#   • R3D                → 3D ResNet (ResNet-18/34/50 with 3D conv)
+#   • R2Plus1D           → (2+1)D decomposition: spatial conv + temporal conv
+#
+# - Transformer-based models:
+#   • ViViT              → Video Vision Transformer
+#   • TimeSFormer        → Space-Time Transformer with divided attention
+#
+#  - Our model
+#   • VTMF2N            
+#
+Model_name: VTMF2N             # Choose one from the list above
+base_network: resnet18         # Backbone for CNN-based models (only ResNet variants supported, e.g., resnet18, resnet50)
+
+# =============================================================================
+# DROPOUT REGULARIZATION (model-specific)
+# =============================================================================
+CNN_drop: 0.10                 # Dropout in CNN backbone (used by basic_CNN, VTMF2N, C3D, R3D, etc.)
+LSTM_drop: 0.10                # Dropout in LSTM layers (used by basic_CNN)
+mlp_drop: 0.00                 # MLP dropout in transformer models (ViViT, TimeSFormer)
+attn_drop: 0.00                # Attention dropout in transformer models
+ca_drop: 0.20                  # Cross-attention dropout (for multi-modal fusion, if applicable)
+
+# =============================================================================
+# TRANSFER LEARNING & FINE-TUNING
+# =============================================================================
+pretrained: False              # Load ImageNet-pretrained weights for CNN backbones?
+frozen_weights: False          # Freeze CNN backbone during training?
+
+# Number of CSCA blocks (for VTMF2N only)
+num_csca: 1                     # How many CSCA blocks to use in VTMF2N
+
+# =============================================================================
+# TRAINING HYPERPARAMETERS
+# =============================================================================
+epochs: 300                    # Total training epochs
+freeze_epochs: 0               # Initial epochs with frozen backbone (0 = no freezing)
+# =============================================================================
+# REPRODUCIBILITY & LOGGING
+# =============================================================================
+print_interval: 1              # Print training stats every N epochs
+save_dir: ./runs               # Directory to save checkpoints and logs
+use_random_seed: 1             # Use random seed? (1 = yes → non-reproducible; 0 = use fixed seed below)
+seed: 3407                     # Fixed seed for reproducibility (used only if use_random_seed == 0)
+# =============================================================================
+# EVALUATION & INITIALIZATION CONTROL
+# =============================================================================
+test_eval: 1                   # Run final evaluation on test set? (1 = yes)
+skip_init_in_train: 1          # Skip manual weight initialization (required for TimeSFormer, ViViT, etc.)
