@@ -1,5 +1,4 @@
 """
-Model Training Module  
 Contains all functions needed to train the Vision-Tactile Multimodal Fusion Network (VTMF2N)  
 """
 
